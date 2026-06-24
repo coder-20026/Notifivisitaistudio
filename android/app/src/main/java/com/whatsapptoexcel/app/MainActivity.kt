@@ -81,6 +81,18 @@ class MainActivity : ComponentActivity() {
         // Fetch location initially only if GPS is enabled and permission is granted
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED && isGpsEnabled()) {
             refreshGpsLocation()
+            try {
+                val serviceIntent = Intent(this, GpsNotificationService::class.java).apply {
+                    action = GpsNotificationService.ACTION_START
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
+            } catch (e: Exception) {
+                // Fail-safe
+            }
         } else {
             currentGps = ""
         }
@@ -149,8 +161,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshGpsLocation() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 100)
+        val permissions = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        
+        val missingPermissions = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missingPermissions.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 100)
             return
         }
 
@@ -159,6 +180,20 @@ class MainActivity : ComponentActivity() {
             gpsAccuracy = 0f
             Toast.makeText(this, "Kripya apna GPS/Location on karein", Toast.LENGTH_LONG).show()
             return
+        }
+
+        // Start Foreground Service
+        try {
+            val serviceIntent = Intent(this, GpsNotificationService::class.java).apply {
+                action = GpsNotificationService.ACTION_START
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+        } catch (e: Exception) {
+            // Fail-safe
         }
 
         isGpsLoading = true
@@ -280,9 +315,65 @@ class MainActivity : ComponentActivity() {
             val monthYear = ExcelExporter.monthYearFromRows(rows)
             val baseName = monthYear?.let { "$it.xlsx" } ?: "Monthly_Report.xlsx"
 
-            shareDocument(bytes, baseName, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            saveToDownloadsAndOpen(bytes, baseName, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         } catch (e: Exception) {
             Toast.makeText(this, "Excel generate karne me error: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun saveToDownloadsAndOpen(bytes: ByteArray, fileName: String, mimeType: String) {
+        try {
+            var fileUri: Uri? = null
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = contentResolver
+                val contentValues = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
+                if (uri != null) {
+                    resolver.openOutputStream(uri)?.use { outputStream ->
+                        outputStream.write(bytes)
+                    }
+                    fileUri = uri
+                }
+            } else {
+                // For Android 9 and below, write to standard Downloads folder
+                val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+                if (!downloadsDir.exists()) {
+                    downloadsDir.mkdirs()
+                }
+                val targetFile = File(downloadsDir, fileName)
+                targetFile.writeBytes(bytes)
+                fileUri = FileProvider.getUriForFile(this, "com.whatsapptoexcel.app.fileprovider", targetFile)
+            }
+
+            if (fileUri != null) {
+                Toast.makeText(this, "Excel file Download folder me save ho gayi hai: $fileName", Toast.LENGTH_LONG).show()
+
+                // Open the Excel file automatically
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(fileUri, mimeType)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                try {
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    // If no Excel app is installed, fallback to sharing chooser
+                    val chooser = Intent.createChooser(intent, "Excel file open / share karein")
+                    startActivity(chooser)
+                }
+            } else {
+                // Fallback to cache directory sharing if uri could not be created
+                shareDocument(bytes, fileName, mimeType)
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Save karne me error: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+            // Fallback
+            shareDocument(bytes, fileName, mimeType)
         }
     }
 
@@ -352,7 +443,14 @@ class MainActivity : ComponentActivity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 100) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            val locationGranted = if (permissions.contains(Manifest.permission.ACCESS_FINE_LOCATION)) {
+                val idx = permissions.indexOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                grantResults.getOrNull(idx) == PackageManager.PERMISSION_GRANTED
+            } else {
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            }
+
+            if (locationGranted) {
                 refreshGpsLocation()
             } else {
                 currentGps = "" // No fallback on permission denied
